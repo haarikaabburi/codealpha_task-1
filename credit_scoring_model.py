@@ -1,0 +1,318 @@
+# ============================================================
+#   CODEALPHA INTERNSHIP — TASK 1: CREDIT SCORING MODEL
+#   Author  : [Your Name]
+#   Stack   : Python | Scikit-learn | Pandas | Matplotlib
+# ============================================================
+
+# ── 1. IMPORTS ──────────────────────────────────────────────
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings("ignore")
+
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.svm import SVC
+
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, roc_curve,
+    confusion_matrix, classification_report
+)
+
+# ── 2. DATASET ───────────────────────────────────────────────
+# Synthetic dataset that mirrors real credit scoring features.
+# To use a real dataset (e.g. Kaggle Give Me Some Credit),
+# replace this block with: df = pd.read_csv("cs-training.csv")
+
+def generate_credit_dataset(n_samples=5000, random_state=42):
+    """
+    Generate a realistic synthetic credit scoring dataset with
+    features that mirror real-world financial history.
+    """
+    np.random.seed(random_state)
+    n = n_samples
+
+    data = {
+        "age":                  np.random.randint(20, 75, n),
+        "income":               np.random.randint(15000, 200000, n),
+        "employment_years":     np.random.randint(0, 40, n),
+        "num_credit_lines":     np.random.randint(1, 20, n),
+        "outstanding_debt":     np.random.randint(0, 100000, n),
+        "debt_to_income_ratio": np.round(np.random.uniform(0, 0.8, n), 3),
+        "num_late_payments":    np.random.randint(0, 15, n),
+        "num_defaults":         np.random.randint(0, 5, n),
+        "credit_utilization":   np.round(np.random.uniform(0, 1, n), 3),
+        "num_inquiries":        np.random.randint(0, 10, n),
+        "months_since_last_delinquency": np.random.randint(0, 120, n),
+        "home_ownership":       np.random.choice(["RENT", "OWN", "MORTGAGE"], n),
+        "loan_purpose":         np.random.choice(["debt_consolidation", "home_improvement",
+                                                   "business", "personal", "education"], n),
+    }
+
+    df = pd.DataFrame(data)
+
+    # Simulate credit default probability based on features
+    default_score = (
+        -0.02 * df["age"]
+        + 0.00001 * df["outstanding_debt"]
+        + 2.5  * df["debt_to_income_ratio"]
+        + 0.15 * df["num_late_payments"]
+        + 0.5  * df["num_defaults"]
+        + 1.5  * df["credit_utilization"]
+        + 0.1  * df["num_inquiries"]
+        - 0.02 * df["employment_years"]
+        + np.random.normal(0, 0.5, n)
+    )
+    prob = 1 / (1 + np.exp(-default_score))
+    df["default"] = (prob > 0.72).astype(int)   # 1 = default, 0 = creditworthy (~20% rate)
+
+    return df
+
+
+# ── 3. FEATURE ENGINEERING ───────────────────────────────────
+def feature_engineering(df):
+    """Derive additional meaningful features."""
+    df = df.copy()
+
+    df["income_to_debt_ratio"]     = df["income"] / (df["outstanding_debt"] + 1)
+    df["payment_history_score"]    = 1 / (df["num_late_payments"] + df["num_defaults"] + 1)
+    df["credit_risk_index"]        = df["debt_to_income_ratio"] * df["credit_utilization"]
+    df["financial_stability_score"]= df["employment_years"] * df["income"] / 1e6
+
+    # Encode categoricals
+    le = LabelEncoder()
+    df["home_ownership_enc"] = le.fit_transform(df["home_ownership"])
+    df["loan_purpose_enc"]   = le.fit_transform(df["loan_purpose"])
+    df.drop(columns=["home_ownership", "loan_purpose"], inplace=True)
+
+    return df
+
+
+# ── 4. EVALUATION HELPER ─────────────────────────────────────
+def evaluate_model(name, model, X_train, X_test, y_train, y_test, results):
+    """Fit model and collect all metrics."""
+    model.fit(X_train, y_train)
+    y_pred  = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, "predict_proba") else None
+
+    metrics = {
+        "Model":     name,
+        "Accuracy":  round(accuracy_score(y_test, y_pred), 4),
+        "Precision": round(precision_score(y_test, y_pred), 4),
+        "Recall":    round(recall_score(y_test, y_pred), 4),
+        "F1-Score":  round(f1_score(y_test, y_pred), 4),
+        "ROC-AUC":   round(roc_auc_score(y_test, y_proba), 4) if y_proba is not None else "N/A",
+    }
+    results.append(metrics)
+    return model, y_pred, y_proba
+
+
+# ── 5. PLOTTING HELPERS ──────────────────────────────────────
+def plot_class_distribution(df):
+    plt.figure(figsize=(5, 4))
+    ax = sns.countplot(x="default", data=df, palette=["#2ecc71", "#e74c3c"])
+    ax.set_title("Class Distribution: Default vs Non-Default", fontsize=13, fontweight="bold")
+    ax.set_xticklabels(["Creditworthy (0)", "Default (1)"])
+    ax.set_xlabel("")
+    for p in ax.patches:
+        ax.annotate(f'{int(p.get_height())}', (p.get_x() + p.get_width() / 2., p.get_height()),
+                    ha='center', va='bottom', fontsize=11)
+    plt.tight_layout()
+    plt.savefig("01_class_distribution.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved: 01_class_distribution.png")
+
+
+def plot_correlation_heatmap(df):
+    plt.figure(figsize=(12, 9))
+    corr = df.select_dtypes(include=np.number).corr()
+    mask = np.triu(np.ones_like(corr, dtype=bool))
+    sns.heatmap(corr, mask=mask, annot=True, fmt=".2f",
+                cmap="coolwarm", linewidths=0.5, annot_kws={"size": 8})
+    plt.title("Feature Correlation Heatmap", fontsize=13, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig("02_correlation_heatmap.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved: 02_correlation_heatmap.png")
+
+
+def plot_roc_curves(roc_data):
+    plt.figure(figsize=(8, 6))
+    colors = ["#3498db", "#e74c3c", "#2ecc71", "#9b59b6", "#f39c12"]
+    for (name, fpr, tpr, auc_val), color in zip(roc_data, colors):
+        plt.plot(fpr, tpr, label=f"{name} (AUC = {auc_val:.3f})", color=color, lw=2)
+    plt.plot([0, 1], [0, 1], "k--", lw=1)
+    plt.xlabel("False Positive Rate", fontsize=12)
+    plt.ylabel("True Positive Rate", fontsize=12)
+    plt.title("ROC Curves — All Models", fontsize=13, fontweight="bold")
+    plt.legend(loc="lower right", fontsize=10)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("03_roc_curves.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved: 03_roc_curves.png")
+
+
+def plot_confusion_matrix(y_test, y_pred, model_name):
+    cm = confusion_matrix(y_test, y_pred)
+    plt.figure(figsize=(5, 4))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                xticklabels=["Creditworthy", "Default"],
+                yticklabels=["Creditworthy", "Default"])
+    plt.title(f"Confusion Matrix — {model_name}", fontsize=12, fontweight="bold")
+    plt.ylabel("Actual")
+    plt.xlabel("Predicted")
+    plt.tight_layout()
+    fname = f"04_confusion_matrix_{model_name.replace(' ', '_')}.png"
+    plt.savefig(fname, dpi=150)
+    plt.close()
+    print(f"  ✓ Saved: {fname}")
+
+
+def plot_feature_importance(model, feature_names):
+    importances = model.feature_importances_
+    indices     = np.argsort(importances)[::-1][:15]
+    plt.figure(figsize=(9, 6))
+    sns.barplot(x=importances[indices], y=np.array(feature_names)[indices],
+                palette="viridis")
+    plt.title("Top-15 Feature Importances — Random Forest", fontsize=13, fontweight="bold")
+    plt.xlabel("Importance Score")
+    plt.tight_layout()
+    plt.savefig("05_feature_importance.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved: 05_feature_importance.png")
+
+
+def plot_model_comparison(results_df):
+    metrics = ["Accuracy", "Precision", "Recall", "F1-Score", "ROC-AUC"]
+    melted  = results_df.melt(id_vars="Model", value_vars=metrics,
+                              var_name="Metric", value_name="Score")
+    plt.figure(figsize=(12, 6))
+    sns.barplot(data=melted, x="Metric", y="Score", hue="Model", palette="Set2")
+    plt.title("Model Comparison — All Metrics", fontsize=13, fontweight="bold")
+    plt.ylim(0.5, 1.0)
+    plt.legend(bbox_to_anchor=(1.01, 1), loc="upper left", fontsize=9)
+    plt.tight_layout()
+    plt.savefig("06_model_comparison.png", dpi=150)
+    plt.close()
+    print("  ✓ Saved: 06_model_comparison.png")
+
+
+# ── 6. MAIN PIPELINE ─────────────────────────────────────────
+def main():
+    print("=" * 60)
+    print("  CODEALPHA — TASK 1: CREDIT SCORING MODEL")
+    print("=" * 60)
+
+    # ── 6.1 Data Generation / Loading
+    print("\n[1/6] Generating dataset...")
+    df_raw = generate_credit_dataset(n_samples=5000)
+    print(f"      Dataset shape : {df_raw.shape}")
+    print(f"      Default rate  : {df_raw['default'].mean():.2%}")
+
+    # ── 6.2 EDA Plots
+    print("\n[2/6] Generating EDA plots...")
+    plot_class_distribution(df_raw)
+    plot_correlation_heatmap(df_raw)
+
+    # ── 6.3 Feature Engineering
+    print("\n[3/6] Feature engineering...")
+    df = feature_engineering(df_raw)
+    X  = df.drop(columns=["default"])
+    y  = df["default"]
+    feature_names = X.columns.tolist()
+    print(f"      Total features : {X.shape[1]}")
+
+    # ── 6.4 Train/Test Split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    print(f"      Train size : {X_train.shape[0]} | Test size : {X_test.shape[0]}")
+
+    # ── 6.5 Model Definitions (Scikit-learn Pipelines)
+    print("\n[4/6] Training models...")
+    models = {
+        "Logistic Regression": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler",  StandardScaler()),
+            ("clf",     LogisticRegression(max_iter=1000, random_state=42)),
+        ]),
+        "Decision Tree": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("clf",     DecisionTreeClassifier(max_depth=8, random_state=42)),
+        ]),
+        "Random Forest": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("clf",     RandomForestClassifier(n_estimators=200, max_depth=10,
+                                                random_state=42, n_jobs=-1)),
+        ]),
+        "Gradient Boosting": Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("clf",     GradientBoostingClassifier(n_estimators=200, learning_rate=0.05,
+                                                    max_depth=5, random_state=42)),
+        ]),
+    }
+
+    results  = []
+    roc_data = []
+    trained  = {}
+
+    for name, pipeline in models.items():
+        print(f"      Training: {name}...")
+        model, y_pred, y_proba = evaluate_model(
+            name, pipeline, X_train, X_test, y_train, y_test, results
+        )
+        trained[name] = (model, y_pred, y_proba)
+        if y_proba is not None:
+            fpr, tpr, _ = roc_curve(y_test, y_proba)
+            roc_data.append((name, fpr, tpr, roc_auc_score(y_test, y_proba)))
+
+    # ── 6.6 Results Table
+    print("\n[5/6] Evaluation results:")
+    results_df = pd.DataFrame(results)
+    print("\n" + results_df.to_string(index=False))
+
+    # Best model
+    best_row   = results_df.loc[results_df["ROC-AUC"].idxmax()]
+    best_name  = best_row["Model"]
+    print(f"\n  🏆 Best Model : {best_name}  (ROC-AUC = {best_row['ROC-AUC']})")
+
+    # Detailed report for best model
+    best_model, best_pred, _ = trained[best_name]
+    print(f"\n  Classification Report — {best_name}:")
+    print(classification_report(y_test, best_pred,
+                                target_names=["Creditworthy", "Default"]))
+
+    # Cross-validation on best model
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    cv_scores = cross_val_score(best_model, X, y, cv=cv, scoring="roc_auc")
+    print(f"  5-Fold CV ROC-AUC : {cv_scores.mean():.4f} ± {cv_scores.std():.4f}")
+
+    # ── 6.7 Visualizations
+    print("\n[6/6] Saving visualizations...")
+    plot_roc_curves(roc_data)
+    plot_confusion_matrix(y_test, best_pred, best_name)
+
+    # Feature importance from Random Forest
+    rf_pipeline = trained["Random Forest"][0]
+    rf_clf      = rf_pipeline.named_steps["clf"]
+    plot_feature_importance(rf_clf, feature_names)
+    plot_model_comparison(results_df)
+
+    print("\n" + "=" * 60)
+    print("  ✅ Task 1 Complete! All outputs saved.")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
